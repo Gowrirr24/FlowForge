@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Traffic‑Responsive Road Design System</title>
+
+<style>
+body{
+  margin:0;
+  display:flex;
+  height:100vh;
+  font-family:Arial, sans-serif;
+  background:#020617;
+  color:white;
+}
+
+#panel{
+  width:560px;
+  padding:25px;
+  border-right:2px solid #1e293b;
+  overflow-y:auto;
+}
+
+h2{ color:#38bdf8; margin-top:0; }
+
+label{
+  display:block;
+  margin-top:14px;
+  font-size:16px;
+}
+
+input{
+  width:100%;
+  padding:12px;
+  margin-top:5px;
+  font-size:16px;
+  border-radius:8px;
+  border:none;
+}
+
+button{
+  width:100%;
+  margin-top:14px;
+  padding:14px;
+  font-size:16px;
+  font-weight:bold;
+  background:#38bdf8;
+  border:none;
+  border-radius:8px;
+  cursor:pointer;
+}
+
+button:hover{ background:#0ea5e9; }
+
+canvas{ flex:1; background:#020617; }
+</style>
+</head>
+
+<body>
+
+<div id="panel">
+  <h2>Traffic Inputs</h2>
+
+  <label>North Traffic (PCU/hr)</label>
+  <input id="north" type="number" value="1800">
+
+  <label>South Traffic (PCU/hr)</label>
+  <input id="south" type="number" value="1600">
+
+  <label>East Traffic (PCU/hr)</label>
+  <input id="east" type="number" value="2200">
+
+  <label>West Traffic (PCU/hr)</label>
+  <input id="west" type="number" value="2000">
+
+  <label>Left Turn Percentage (%)</label>
+  <input id="left" type="number" value="35">
+
+  <label>Right Turn Percentage (%)</label>
+  <input id="right" type="number" value="20">
+
+  <button onclick="generateDesign()">Generate Road Design</button>
+  <button onclick="downloadImage()">Download PNG</button>
+  <button onclick="downloadData()">Download JSON</button>
+
+  <h2 style="margin-top:25px">Design Summary</h2>
+  <div id="summary">Click “Generate Road Design”</div>
+</div>
+
+<canvas id="canvas" width="1200" height="800"></canvas>
+
+<script>
+/* =====================
+   GLOBAL STATE
+===================== */
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const cx = canvas.width/2;
+const cy = canvas.height/2;
+
+let animOffset = 0;
+let pulse = 0;
+let animationActive = false;
+let cachedInputs = null;
+let lastDesign = {};
+
+/* =====================
+   ENGINEERING RULES
+===================== */
+function lanesRequired(flow){
+  return Math.max(1, Math.ceil(flow / 700));
+}
+
+/* =====================
+   TRAFFIC → VISUAL LOGIC
+===================== */
+function vehicleCount(flow){
+  if(flow < 800) return 2;
+  if(flow < 1500) return 5;
+  if(flow < 2500) return 12;
+  if(flow < 4000) return 20;
+  return 30;
+}
+
+function trafficWeight(flow, total){
+  return Math.max(0.15, flow / total);
+}
+
+/* =====================
+   DESIGN MEANING
+===================== */
+function designElementMeaning(junctionType, leftPct){
+  return {
+    slipLane: junctionType==="Free‑Flow Junction" && leftPct>30,
+    islands: junctionType!=="Signalized Intersection",
+    yellowDesc:
+      "Yellow curved lines represent free‑flow left‑turn slip lanes allowing uninterrupted turning.",
+    greyDesc:
+      "Grey circular shapes represent traffic islands that channelize traffic and reduce conflict points."
+  };
+}
+
+/* =====================
+   DRAW HELPERS
+===================== */
+function clear(){ ctx.clearRect(0,0,canvas.width,canvas.height); }
+
+function road(x1,y1,x2,y2,w){
+  ctx.strokeStyle="#38bdf8";
+  ctx.lineWidth=w;
+  ctx.beginPath();
+  ctx.moveTo(x1,y1);
+  ctx.lineTo(x2,y2);
+  ctx.stroke();
+}
+
+function island(x,y,r){
+  ctx.fillStyle="#64748b";
+  ctx.beginPath();
+  ctx.arc(x,y,r,0,Math.PI*2);
+  ctx.fill();
+}
+
+function curve(x,y,r,a1,a2){
+  ctx.strokeStyle="#fbbf24";
+  ctx.lineWidth=8;
+  ctx.beginPath();
+  ctx.arc(x,y,r,a1,a2);
+  ctx.stroke();
+}
+
+function dominantFlow(x1,y1,x2,y2,offset,weight){
+  ctx.strokeStyle=`rgba(0,255,120,${0.25+weight})`;
+  ctx.lineWidth=6+weight*8;
+  ctx.setLineDash([18,14]);
+  ctx.lineDashOffset=-offset*1.5;
+  ctx.beginPath();
+  ctx.moveTo(x1,y1);
+  ctx.lineTo(x2,y2);
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+function animatedSlip(x,y,r,a1,a2,offset,leftPct){
+  ctx.strokeStyle=`rgba(251,191,36,${0.4+leftPct/100})`;
+  ctx.lineWidth=6+leftPct/10;
+  ctx.setLineDash([12,16]);
+  ctx.lineDashOffset=-offset;
+  ctx.beginPath();
+  ctx.arc(x,y,r,a1,a2);
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+function trafficDot(x,y,intensity){
+  ctx.fillStyle=`rgba(0,255,120,${0.4+intensity})`;
+  ctx.beginPath();
+  ctx.arc(x,y,4+intensity*2.5,0,Math.PI*2);
+  ctx.fill();
+}
+
+function flowArrow(x,y,angle,weight){
+  ctx.save();
+  ctx.translate(x,y);
+  ctx.rotate(angle);
+  ctx.fillStyle=`rgba(0,255,120,${0.3+weight})`;
+  ctx.beginPath();
+  ctx.moveTo(0,-8);
+  ctx.lineTo(25+weight*20,0);
+  ctx.lineTo(0,8);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+function label(t,x,y){
+  ctx.fillStyle="white";
+  ctx.font="15px Arial";
+  ctx.fillText(t,x,y);
+}
+
+/* =====================
+   LEGEND BOX
+===================== */
+function drawLegend(){
+  ctx.fillStyle="rgba(2,6,23,0.85)";
+  ctx.fillRect(20,20,320,170);
+  ctx.strokeStyle="#38bdf8";
+  ctx.strokeRect(20,20,320,170);
+
+  ctx.fillStyle="white";
+  ctx.font="15px Arial";
+  ctx.fillText("LEGEND",140,45);
+
+  ctx.fillStyle="#38bdf8";
+  ctx.fillRect(30,60,30,6);
+  ctx.fillStyle="white";
+  ctx.fillText("Road Lanes",70,68);
+
+  ctx.strokeStyle="#00ff78";
+  ctx.lineWidth=6;
+  ctx.beginPath(); ctx.moveTo(30,85); ctx.lineTo(60,85); ctx.stroke();
+  ctx.fillStyle="white";
+  ctx.fillText("High Traffic Flow",70,90);
+
+  ctx.fillStyle="#00ff78";
+  ctx.beginPath(); ctx.arc(45,110,6,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle="white";
+  ctx.fillText("Moving Vehicles (PCU based)",70,115);
+
+  ctx.strokeStyle="#fbbf24";
+  ctx.lineWidth=6;
+  ctx.beginPath(); ctx.arc(45,140,15,0,Math.PI/2); ctx.stroke();
+  ctx.fillStyle="white";
+  ctx.fillText("Slip Lane (Free‑Flow Turn)",70,145);
+
+  ctx.fillStyle="#64748b";
+  ctx.beginPath(); ctx.arc(45,165,10,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle="white";
+  ctx.fillText("Traffic Island",70,170);
+}
+
+/* =====================
+   DESIGN DRAW
+===================== */
+function drawDesign(){
+  if(!cachedInputs) return;
+  clear();
+
+  const {N,S,E,W,L} = cachedInputs;
+  const total=N+S+E+W;
+
+  const lnN=lanesRequired(N);
+  const lnS=lanesRequired(S);
+  const lnE=lanesRequired(E);
+  const lnW=lanesRequired(W);
+
+  let junction="Signalized Intersection";
+  if(total>3000) junction="Channelized Junction";
+  if(total>5000) junction="Free‑Flow Junction";
+
+  const elements = designElementMeaning(junction,L);
+
+  const wN=trafficWeight(N,total);
+  const wS=trafficWeight(S,total);
+  const wE=trafficWeight(E,total);
+  const wW=trafficWeight(W,total);
+
+  const len=300, gap=22;
+
+  for(let i=0;i<lnN;i++) road(cx-(lnN-1)*gap/2+i*gap,cy,cx-(lnN-1)*gap/2+i*gap,cy-len,14);
+  for(let i=0;i<lnS;i++) road(cx-(lnS-1)*gap/2+i*gap,cy,cx-(lnS-1)*gap/2+i*gap,cy+len,14);
+  for(let i=0;i<lnE;i++) road(cx,cy-(lnE-1)*gap/2+i*gap,cx+len,cy-(lnE-1)*gap/2+i*gap,14);
+  for(let i=0;i<lnW;i++) road(cx,cy-(lnW-1)*gap/2+i*gap,cx-len,cy-(lnW-1)*gap/2+i*gap,14);
+
+  if(elements.islands){
+    island(cx-70,cy-70,30); island(cx+70,cy-70,30);
+    island(cx-70,cy+70,30); island(cx+70,cy+70,30);
+  }
+
+  if(elements.slipLane){
+    curve(cx-120,cy-120,160,0,Math.PI/2);
+    animatedSlip(cx-120,cy-120,160,0,Math.PI/2,animOffset,L);
+  }
+
+  dominantFlow(cx,cy,cx,cy-len,animOffset,wN);
+  dominantFlow(cx,cy,cx,cy+len,animOffset,wS);
+  dominantFlow(cx,cy,cx+len,cy,animOffset,wE);
+  dominantFlow(cx,cy,cx-len,cy,animOffset,wW);
+
+  const nC=vehicleCount(N), sC=vehicleCount(S), eC=vehicleCount(E), wC=vehicleCount(W);
+
+  for(let i=0;i<nC;i++) trafficDot(cx,cy-((animOffset*4+i*28)%300),nC/20);
+  for(let i=0;i<sC;i++) trafficDot(cx,cy+((animOffset*4+i*28)%300),sC/20);
+  for(let i=0;i<eC;i++) trafficDot(cx+((animOffset*4+i*28)%300),cy,eC/20);
+  for(let i=0;i<wC;i++) trafficDot(cx-((animOffset*4+i*28)%300),cy,wC/20);
+
+  flowArrow(cx,cy-140,-Math.PI/2,wN);
+  flowArrow(cx,cy+140, Math.PI/2,wS);
+  flowArrow(cx+140,cy,0,wE);
+  flowArrow(cx-140,cy,Math.PI,wW);
+
+  pulse+=0.05;
+  ctx.beginPath();
+  ctx.arc(cx,cy,18+Math.sin(pulse)*4,0,Math.PI*2);
+  ctx.fillStyle="rgba(239,68,68,0.25)";
+  ctx.fill();
+
+  label(`North: ${lnN}`,cx-40,cy-len-10);
+  label(`South: ${lnS}`,cx-40,cy+len+25);
+  label(`East: ${lnE}`,cx+len+10,cy);
+  label(`West: ${lnW}`,cx-len-120,cy);
+
+  drawLegend();
+
+  lastDesign={
+    junctionType:junction,
+    totalTraffic:total,
+    lanes:{north:lnN,south:lnS,east:lnE,west:lnW},
+    yellow:elements.yellowDesc,
+    grey:elements.greyDesc
+  };
+
+  summary.innerHTML=`
+    <b>Junction Type:</b> ${junction}<br><br>
+    <b>Total Traffic:</b> ${total} PCU/hr<br><br>
+    <b>Yellow Lines:</b> ${elements.yellowDesc}<br><br>
+    <b>Grey Circles:</b> ${elements.greyDesc}
+  `;
+}
+
+/* =====================
+   CONTROLS
+===================== */
+function generateDesign(){
+  cachedInputs={
+    N:+north.value,
+    S:+south.value,
+    E:+east.value,
+    W:+west.value,
+    L:+left.value
+  };
+  animationActive=true;
+}
+
+function animate(){
+  if(animationActive){
+    animOffset+=2;
+    drawDesign();
+  }
+  requestAnimationFrame(animate);
+}
+animate();
+
+/* =====================
+   DOWNLOADS
+===================== */
+function downloadImage(){
+  const a=document.createElement("a");
+  a.href=canvas.toDataURL("image/png");
+  a.download="road_design.png";
+  a.click();
+}
+
+function downloadData(){
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(
+    new Blob([JSON.stringify(lastDesign,null,2)],{type:"application/json"})
+  );
+  a.download="road_design.json";
+  a.click();
+}
+</script>
+
+</body>
+</html>
